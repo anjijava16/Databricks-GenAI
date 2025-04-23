@@ -8,3 +8,7 @@
 
 # Reference Project Links
 1. https://github.com/databricks/tmm/
+
+
+# AWS with Databricks Gen AI
+1. https://catalog.workshops.aws/dare-genai-rag-databricks/en-US
