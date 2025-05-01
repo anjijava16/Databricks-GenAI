@@ -1,5 +1,12 @@
 # Databricks-GenAI
 
+# Databricks Workshop Creds
+
+1. URL : https://dbc-46aea839-6b3d.cloud.databricks.com/browse?o=3798550014354878
+2. Email ID : anjaiahsprtech@gmail.com
+3. PwD: Same
+
+
 # Ref
 1. https://huggingface.co/spaces/databricks/dbrx-instruct
 2. https://huggingface.co/spaces/databricks-demos/chatbot
