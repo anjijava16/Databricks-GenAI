@@ -27,16 +27,16 @@ chat_completion = client.chat.completions.create(
 )
 
 print(chat_completion.choices[0].message.content)
-
-
-#########
-SELECT ai_query('databricks-dbrx-instruct',
-    request => "<Please provide your input string here!>")
-
-=====
-curl \
-  -u token:$DATABRICKS_TOKEN \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -d@data.json \
-  https://adb-3131138635619485.5.azuredatabricks.net/serving-endpoints/databricks-dbrx-instruct/invocations
+#
+#
+# #########
+# SELECT ai_query('databricks-dbrx-instruct',
+#     request => "<Please provide your input string here!>")
+#
+# =====
+# curl \
+#   -u token:$DATABRICKS_TOKEN \
+#   -X POST \
+#   -H "Content-Type: application/json" \
+#   -d@data.json \
+#   https://adb-3131138635619485.5.azuredatabricks.net/serving-endpoints/databricks-dbrx-instruct/invocations

@@ -12,3 +12,9 @@
 
 # AWS with Databricks Gen AI
 1. https://catalog.workshops.aws/dare-genai-rag-databricks/en-US
+
+
+# RAG with Databricks AWS bedorck models
+1. https://catalog.workshops.aws/dare-genai-rag-databricks/en-US
+2. https://docs.databricks.com/aws/en/generative-ai/retrieval-augmented-generation
+3. https://github.com/jwfaure-db/dare-rag/
