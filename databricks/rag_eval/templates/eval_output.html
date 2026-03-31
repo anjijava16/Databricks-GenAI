@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Evaluation output</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+
+        .header {
+            a.button {
+                padding: 4px 8px;
+                line-height: 20px;
+                box-shadow: none;
+                height: 20px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                vertical-align: middle;
+                background-color: rgb(34, 114, 180);
+                color: rgb(255, 255, 255);
+                text-decoration: none;
+                animation-duration: 0s;
+                transition: none 0s ease 0s;
+                position: relative;
+                white-space: nowrap;
+                text-align: center;
+                border: 1px solid rgb(192, 205, 216);
+                cursor: pointer;
+                user-select: none;
+                touch-action: manipulation;
+                border-radius: 4px;
+                gap: 6px;
+            }
+
+            a.button:hover {
+                background-color: rgb(14, 83, 139) !important;
+                border-color: transparent !important;
+                color: rgb(255, 255, 255) !important;
+            }
+        }
+
+        .warnings-section {
+            margin-top: 8px;
+
+            ul {
+                list-style-type: none;
+            }
+        }
+
+        .instructions-section {
+            margin-top: 16px;
+            font-size: 14px;
+
+            ul {
+                margin-top: 0;
+                margin-bottom: 0;
+            }
+        }
+
+        code {
+            font-family: monospace;
+        }
+
+        .note {
+            color: #666;
+        }
+
+        a {
+            color: #2272B4;
+            text-decoration: none;
+        }
+
+        a:hover {
+            color: #005580;
+        }
+    </style>
+</head>
+<body>
+<div>
+    <div class="header">
+        <a href="{{ eval_results_url }}" class="button">
+            View evaluation results{{ ': ' + summary_text if summary_text else "."}}
+            <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" fill="none" viewBox="0 0 16 16" aria-hidden="true" focusable="false" class="">
+                <path fill="currentColor" d="M10 1h5v5h-1.5V3.56L8.53 8.53 7.47 7.47l4.97-4.97H10z"></path>
+                <path fill="currentColor" d="M1 2.75A.75.75 0 0 1 1.75 2H8v1.5H2.5v10h10V8H14v6.25a.75.75 0 0 1-.75.75H1.75a.75.75 0 0 1-.75-.75z"></path>
+            </svg>
+        </a>
+    </div>
+</div>
+</body>
+</html>

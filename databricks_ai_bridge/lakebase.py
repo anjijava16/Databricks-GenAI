@@ -1,0 +1,1280 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from enum import Enum
+from threading import Lock
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Sequence
+
+from databricks.sdk import WorkspaceClient
+
+if TYPE_CHECKING:
+    from sqlalchemy import URL
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+try:
+    import psycopg
+    from psycopg import sql
+    from psycopg.rows import DictRow, dict_row
+    from psycopg_pool import AsyncConnectionPool, ConnectionPool
+except ImportError as e:
+    raise ImportError(
+        "LakebasePool requires databricks-ai-bridge[memory]. "
+        "Please install with: pip install databricks-ai-bridge[memory]"
+    ) from e
+
+__all__ = [
+    "AsyncLakebasePool",
+    "AsyncLakebaseSQLAlchemy",
+    "LakebasePool",
+]
+
+logger = logging.getLogger(__name__)
+
+# Token cache duration based on Databricks Lakebase docs (15 minutes)
+# https://docs.databricks.com/aws/en/oltp/projects/authentication?language=Python%3A+SQLAlchemy
+DEFAULT_TOKEN_CACHE_DURATION_SECONDS = 15 * 60  # 15 minutes (900 seconds)
+DEFAULT_POOL_RECYCLE_SECONDS = 14 * 60  # 14 minutes (before token cache expires)
+DEFAULT_MIN_SIZE = 1
+DEFAULT_MAX_SIZE = 10
+DEFAULT_TIMEOUT = 30.0
+# Default values from https://docs.databricks.com/aws/en/oltp/projects/connect-overview#connection-string-components
+DEFAULT_SSLMODE = "require"
+DEFAULT_PORT = 5432
+DEFAULT_DATABASE = "databricks_postgres"
+
+# Valid identity types for create_role
+IdentityType = Literal["USER", "SERVICE_PRINCIPAL", "GROUP"]
+
+
+class TablePrivilege(str, Enum):
+    """PostgreSQL table privileges for GRANT statements.
+
+    See: https://www.postgresql.org/docs/16/sql-grant.html
+    """
+
+    SELECT = "SELECT"
+    INSERT = "INSERT"
+    UPDATE = "UPDATE"
+    DELETE = "DELETE"
+    TRUNCATE = "TRUNCATE"
+    REFERENCES = "REFERENCES"
+    TRIGGER = "TRIGGER"
+    ALL = "ALL"  # Renders as ALL PRIVILEGES
+
+
+class SchemaPrivilege(str, Enum):
+    """PostgreSQL schema privileges for GRANT statements.
+
+    See: https://www.postgresql.org/docs/current/sql-grant.html
+    """
+
+    USAGE = "USAGE"
+    CREATE = "CREATE"
+    ALL = "ALL"  # Renders as ALL PRIVILEGES
+
+
+class SequencePrivilege(str, Enum):
+    """PostgreSQL sequence privileges for GRANT statements.
+
+    See: https://www.postgresql.org/docs/current/sql-grant.html
+    """
+
+    USAGE = "USAGE"
+    SELECT = "SELECT"
+    UPDATE = "UPDATE"
+    ALL = "ALL"  # Renders as ALL PRIVILEGES
+
+
+def _is_branch_resource_path(branch: str) -> bool:
+    """Check if branch is a full resource path like 'projects/{id}/branches/{id}'."""
+    return branch.startswith("projects/") and "/branches/" in branch
+
+
+class _LakebaseBase:
+    """
+    Base class for Lakebase connections: resolve host, infer username,
+    token cache + minting, and conninfo building.
+
+    Supports two modes: Lakebase Provisioned VS Autoscaling
+    https://docs.databricks.com/aws/en/oltp/#feature-comparison
+
+    - **Provisioned**: Pass ``instance_name``.
+    - **Autoscaling**: Pass ``autoscaling_endpoint``, or ``project`` and ``branch``.
+
+    Provisioned and autoscaling are mutually exclusive.
+
+    Subclasses implement specific initialization and lifecycle methods.
+    """
+
+    def __init__(
+        self,
+        *,
+        instance_name: str | None = None,
+        autoscaling_endpoint: str | None = None,
+        project: str | None = None,
+        branch: str | None = None,
+        workspace_client: WorkspaceClient | None = None,
+        token_cache_duration_seconds: int = DEFAULT_TOKEN_CACHE_DURATION_SECONDS,
+    ) -> None:
+        self.workspace_client: WorkspaceClient = workspace_client or WorkspaceClient()
+        self.token_cache_duration_seconds: int = token_cache_duration_seconds
+
+        # --- Parameter validation ---
+        is_autoscaling = (
+            autoscaling_endpoint is not None or project is not None or branch is not None
+        )
+
+        # instance_name is mutually exclusive with all autoscaling parameters
+        if instance_name is not None and is_autoscaling:
+            raise ValueError(
+                "Cannot provide 'instance_name' (provisioned) together with "
+                "autoscaling parameters ('autoscaling_endpoint', 'project', 'branch'). "
+                "Choose one mode."
+            )
+
+        # autoscaling_endpoint is mutually exclusive with project/branch
+        if autoscaling_endpoint is not None and (project is not None or branch is not None):
+            raise ValueError(
+                "Cannot provide 'autoscaling_endpoint' together with "
+                "'project' or 'branch'. Use one autoscaling method."
+            )
+
+        # project without branch (and no autoscaling_endpoint) is invalid
+        if project is not None and branch is None and autoscaling_endpoint is None:
+            raise ValueError(
+                "Both 'project' and 'branch' are required to use a Lakebase "
+                "autoscaling instance. Please specify both parameters."
+            )
+
+        # branch validation: detect resource path vs plain name
+        if branch is not None and autoscaling_endpoint is None:
+            if _is_branch_resource_path(branch):
+                if project is not None:
+                    raise ValueError(
+                        "'branch' is already a full resource path, do not pass 'project'."
+                    )
+            else:
+                if project is None:
+                    raise ValueError(
+                        "When 'branch' is a plain name, 'project' is required. "
+                        "Provide 'project' or use a full resource path for 'branch' "
+                        "(e.g. 'projects/{project_id}/branches/{branch_id}')."
+                    )
+
+        if not is_autoscaling and instance_name is None:
+            raise ValueError(
+                "Must provide either 'instance_name' (provisioned), "
+                "'autoscaling_endpoint', or 'branch' (autoscaling)."
+            )
+
+        self._is_autoscaling: bool = is_autoscaling
+
+        self.instance_name: str | None = instance_name
+        self.project: str | None = project
+        self.branch: str | None = branch
+
+        if autoscaling_endpoint is not None:
+            self._endpoint_name: str | None = autoscaling_endpoint
+            self.host = self._resolve_endpoint_host()
+        elif is_autoscaling:
+            self._endpoint_name = None
+            self.host = self._resolve_autoscaling_host()
+        else:
+            self._endpoint_name = None
+            self.host = self._resolve_provisioned_host()
+
+        self.username: str = self._infer_username()
+
+        self._cached_token: str | None = None
+        self._cache_ts: float | None = None
+
+    # --- Host resolution ---
+
+    def _resolve_provisioned_host(self) -> str:
+        """Resolve host via the Lakebase provisioned database API."""
+        if self.instance_name is None:
+            raise RuntimeError("instance_name is required for provisioned mode")
+        try:
+            instance = self.workspace_client.database.get_database_instance(self.instance_name)
+        except Exception as exc:
+            raise ValueError(
+                f"Unable to resolve Lakebase provisioned instance '{self.instance_name}'. "
+                "Verify the instance name is correct.\n"
+                "To list available instances, use:\n"
+                "  workspace_client.database.list_database_instances()"
+            ) from exc
+
+        resolved_host = getattr(instance, "read_write_dns", None) or getattr(
+            instance, "read_only_dns", None
+        )
+
+        if not resolved_host:
+            raise ValueError(
+                f"Lakebase host not found for instance '{self.instance_name}'. "
+                "Ensure the instance is running and in AVAILABLE state."
+            )
+
+        return resolved_host
+
+    def _resolve_endpoint_host(self) -> str:
+        """Resolve host via endpoint name using the Lakebase autoscaling API.
+
+        Calls ``get_endpoint(name=...)`` and extracts the host from
+        ``endpoint.status.hosts.host``.
+        """
+        if self._endpoint_name is None:
+            raise RuntimeError("endpoint name is required for autoscaling endpoint mode")
+        try:
+            ep = self.workspace_client.postgres.get_endpoint(name=self._endpoint_name)
+        except Exception as exc:
+            raise ValueError(
+                f"Unable to resolve Lakebase autoscaling endpoint '{self._endpoint_name}'. "
+                "Verify the endpoint name is correct.\n"
+                "To list available endpoints, use:\n"
+                '  workspace_client.postgres.list_endpoints(parent="projects/<project>/branches/<branch>")'
+            ) from exc
+
+        ep_status = getattr(ep, "status", None)
+        hosts = getattr(ep_status, "hosts", None)
+        resolved_host = getattr(hosts, "host", None) if hosts else None
+
+        if not resolved_host:
+            raise ValueError(
+                f"Host not found on endpoint '{self._endpoint_name}'. "
+                "Ensure the endpoint is in AVAILABLE state."
+            )
+
+        return resolved_host
+
+    def _resolve_autoscaling_host(self) -> str:
+        """Resolve host via the Lakebase autoscaling postgres API.
+
+        Constructs the branch parent path from ``self.project`` and ``self.branch``,
+        lists endpoints, finds the READ_WRITE endpoint, and extracts the host and endpoint name.
+
+        See https://databricks-sdk-py.readthedocs.io/en/latest/workspace/postgres/postgres.html#databricks.sdk.service.postgres.PostgresAPI.list_endpoints
+        """
+        if self.branch and _is_branch_resource_path(self.branch):
+            branch_parent = self.branch
+        else:
+            branch_parent = f"projects/{self.project}/branches/{self.branch}"
+
+        try:
+            endpoints = list(self.workspace_client.postgres.list_endpoints(parent=branch_parent))
+        except Exception as exc:
+            raise ValueError(
+                f"Unable to list endpoints for parent='{branch_parent}'. "
+                "Verify the parent path is correct.\n"
+                "To find available projects and branches, use:\n"
+                "  workspace_client.postgres.list_projects()\n"
+                '  workspace_client.postgres.list_branches(parent="projects/<project_name>")'
+            ) from exc
+
+        # Find the READ_WRITE endpoint
+        rw_endpoint = None
+        for ep in endpoints:
+            ep_status = getattr(ep, "status", None)
+            ep_type = getattr(ep_status, "endpoint_type", None)
+            if ep_type and "READ_WRITE" in str(ep_type):
+                rw_endpoint = ep
+                break
+
+        if rw_endpoint is None:
+            raise ValueError(
+                f"No READ_WRITE endpoint found for parent='{branch_parent}'. "
+                "Ensure the branch has an active endpoint with compute running.\n"
+                "To check endpoints, use:\n"
+                f'  workspace_client.postgres.list_endpoints(parent="{branch_parent}")'
+            )
+
+        # Extract host from endpoint status
+        ep_status = rw_endpoint.status
+        hosts = getattr(ep_status, "hosts", None)
+        resolved_host = getattr(hosts, "host", None) if hosts else None
+
+        if not resolved_host:
+            raise ValueError(
+                f"Host not found on READ_WRITE endpoint for project='{self.project}', "
+                f"branch='{self.branch}'. Ensure the endpoint is in AVAILABLE state."
+            )
+
+        self._endpoint_name = rw_endpoint.name
+        return resolved_host
+
+    # --- Token caching ---
+
+    def _get_cached_token(self) -> str | None:
+        """Check if the cached token is still valid."""
+        if not self._cached_token or not self._cache_ts:
+            return None
+        if (time.time() - self._cache_ts) < self.token_cache_duration_seconds:
+            return self._cached_token
+        return None
+
+    def _mint_token(self) -> str:
+        if self._is_autoscaling:
+            return self._mint_token_autoscaling()
+        return self._mint_token_provisioned()
+
+    def _mint_token_provisioned(self) -> str:
+        if self.instance_name is None:
+            raise RuntimeError("instance_name is required for provisioned mode")
+        try:
+            cred = self.workspace_client.database.generate_database_credential(
+                request_id=str(uuid.uuid4()),
+                instance_names=[self.instance_name],
+            )
+        except Exception as exc:
+            raise ConnectionError(
+                f"Failed to obtain credential for Lakebase instance "
+                f"'{self.instance_name}'. Ensure the caller has access."
+            ) from exc
+
+        if not cred.token:
+            raise RuntimeError("Failed to generate database credential: no token received")
+
+        return cred.token
+
+    def _mint_token_autoscaling(self) -> str:
+        if self._endpoint_name is None:
+            raise RuntimeError("endpoint name is required for autoscaling mode")
+        try:
+            cred = self.workspace_client.postgres.generate_database_credential(
+                endpoint=self._endpoint_name,
+            )
+        except Exception as exc:
+            raise ConnectionError(
+                f"Failed to obtain credential for Lakebase autoscaling endpoint "
+                f"'{self._endpoint_name}'. Ensure the caller has access."
+            ) from exc
+
+        if not cred.token:
+            raise RuntimeError("Failed to generate database credential: no token received")
+
+        return cred.token
+
+    def _conninfo(self) -> str:
+        """Build the connection info string."""
+        return (
+            f"dbname={DEFAULT_DATABASE} user={self.username} "
+            f"host={self.host} port={DEFAULT_PORT} sslmode={DEFAULT_SSLMODE}"
+        )
+
+    def _infer_username(self) -> str:
+        """Get username for database connection."""
+        try:
+            user = self.workspace_client.current_user.me()
+            if user and user.user_name:
+                return user.user_name
+        except Exception:
+            logger.debug("Could not get username for Lakebase credentials.")
+        raise ValueError("Unable to infer username for Lakebase connection.")
+
+
+class LakebasePool(_LakebaseBase):
+    """Sync Lakebase connection pool built on psycopg with rotating credentials.
+
+    Supports two modes: Lakebase Provisioned VS Autoscaling
+    https://docs.databricks.com/aws/en/oltp/#feature-comparison
+
+    - **Provisioned**: Pass ``instance_name``.
+    - **Autoscaling**: Pass ``autoscaling_endpoint``, or ``project`` and ``branch``.
+    """
+
+    def __init__(
+        self,
+        *,
+        instance_name: str | None = None,
+        autoscaling_endpoint: str | None = None,
+        project: str | None = None,
+        branch: str | None = None,
+        workspace_client: WorkspaceClient | None = None,
+        token_cache_duration_seconds: int = DEFAULT_TOKEN_CACHE_DURATION_SECONDS,
+        **pool_kwargs: dict[str, Any],
+    ) -> None:
+        super().__init__(
+            instance_name=instance_name,
+            autoscaling_endpoint=autoscaling_endpoint,
+            project=project,
+            branch=branch,
+            workspace_client=workspace_client,
+            token_cache_duration_seconds=token_cache_duration_seconds,
+        )
+
+        # Sync lock for thread-safe token caching
+        self._cache_lock = Lock()
+
+        # Create connection pool that fetches a rotating M2M OAuth token
+        # https://docs.databricks.com/aws/en/oltp/instances/query/notebook#psycopg3
+        pool = self
+
+        class RotatingConnection(psycopg.Connection):
+            @classmethod
+            def connect(cls, conninfo: str = "", **kwargs):
+                token = pool._get_token()
+                kwargs["password"] = token
+                logger.debug(
+                    "Connecting to Lakebase: user=%s, host=%s, token=%s...%s (len=%d)",
+                    pool.username,
+                    pool.host,
+                    token[:10],
+                    token[-5:],
+                    len(token),
+                )
+                # Call the superclass's connect method with updated kwargs
+                return super().connect(conninfo, **kwargs)
+
+        default_kwargs: dict[str, object] = {
+            "autocommit": True,
+            "row_factory": dict_row,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        }
+
+        # Get pool config values (overrides by user pool_kwargs)
+        min_size = pool_kwargs.pop("min_size", DEFAULT_MIN_SIZE)
+        max_size = pool_kwargs.pop("max_size", DEFAULT_MAX_SIZE)
+        timeout = pool_kwargs.pop("timeout", DEFAULT_TIMEOUT)
+
+        self._pool: ConnectionPool[psycopg.Connection[DictRow]] = ConnectionPool(  # type: ignore[invalid-assignment]
+            conninfo=self._conninfo(),
+            kwargs=default_kwargs,
+            min_size=min_size,  # type: ignore[invalid-argument-type]
+            max_size=max_size,  # type: ignore[invalid-argument-type]
+            timeout=timeout,  # type: ignore[invalid-argument-type]
+            open=True,
+            connection_class=RotatingConnection,
+            **pool_kwargs,  # type: ignore[invalid-argument-type]
+        )
+
+        logger.info(
+            "lakebase pool ready: host=%s db=%s min=%s max=%s timeout=%s cache=%ss",
+            self.host,
+            DEFAULT_DATABASE,
+            min_size,
+            max_size,
+            timeout,
+            self.token_cache_duration_seconds,
+        )
+
+    def _get_token(self) -> str:
+        """Get cached token or mint a new one if expired (thread-safe)."""
+        with self._cache_lock:
+            if cached_token := self._get_cached_token():
+                return cached_token
+
+            token = self._mint_token()
+            self._cached_token = token
+            self._cache_ts = time.time()
+            return token
+
+    @property
+    def pool(self) -> ConnectionPool[psycopg.Connection[DictRow]]:
+        """Access the underlying connection pool."""
+        return self._pool
+
+    def connection(self):
+        """Get a connection from the pool."""
+        return self._pool.connection()
+
+    def close(self) -> None:
+        """Close the connection pool."""
+        self._pool.close()
+
+
+class AsyncLakebasePool(_LakebaseBase):
+    """Async Lakebase connection pool built on psycopg with rotating credentials.
+
+    Supports two modes: Lakebase Provisioned VS Autoscaling
+    https://docs.databricks.com/aws/en/oltp/#feature-comparison
+
+    - **Provisioned**: Pass ``instance_name``.
+    - **Autoscaling**: Pass ``autoscaling_endpoint``, or ``project`` and ``branch``.
+    """
+
+    def __init__(
+        self,
+        *,
+        instance_name: str | None = None,
+        autoscaling_endpoint: str | None = None,
+        project: str | None = None,
+        branch: str | None = None,
+        workspace_client: WorkspaceClient | None = None,
+        token_cache_duration_seconds: int = DEFAULT_TOKEN_CACHE_DURATION_SECONDS,
+        **pool_kwargs: object,
+    ) -> None:
+        super().__init__(
+            instance_name=instance_name,
+            autoscaling_endpoint=autoscaling_endpoint,
+            project=project,
+            branch=branch,
+            workspace_client=workspace_client,
+            token_cache_duration_seconds=token_cache_duration_seconds,
+        )
+
+        # Async lock for coroutine-safe token caching
+        self._cache_lock = asyncio.Lock()
+
+        # Create async connection pool that fetches a rotating M2M OAuth token
+        pool = self
+
+        class AsyncRotatingConnection(psycopg.AsyncConnection):
+            @classmethod
+            async def connect(cls, conninfo: str = "", **kwargs):
+                token = await pool._get_token_async()
+                kwargs["password"] = token
+                logger.debug(
+                    "Connecting to Lakebase (async): user=%s, host=%s, token=%s...%s (len=%d)",
+                    pool.username,
+                    pool.host,
+                    token[:10],
+                    token[-5:],
+                    len(token),
+                )
+                # Call the superclass's connect method with updated kwargs
+                return await super().connect(conninfo, **kwargs)
+
+        default_kwargs: dict[str, object] = {
+            "autocommit": True,
+            "row_factory": dict_row,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        }
+
+        # Get pool config values (overrides by user pool_kwargs)
+        min_size = pool_kwargs.pop("min_size", DEFAULT_MIN_SIZE)
+        max_size = pool_kwargs.pop("max_size", DEFAULT_MAX_SIZE)
+        timeout = pool_kwargs.pop("timeout", DEFAULT_TIMEOUT)
+
+        self._pool: AsyncConnectionPool[psycopg.AsyncConnection[DictRow]] = AsyncConnectionPool(  # type: ignore[invalid-assignment]
+            conninfo=self._conninfo(),
+            kwargs=default_kwargs,
+            min_size=min_size,  # type: ignore[invalid-argument-type]
+            max_size=max_size,  # type: ignore[invalid-argument-type]
+            timeout=timeout,  # type: ignore[invalid-argument-type]
+            open=False,  # Don't open yet, must be opened with await
+            connection_class=AsyncRotatingConnection,
+            **pool_kwargs,  # type: ignore[invalid-argument-type]
+        )
+
+        logger.info(
+            "async lakebase pool created: host=%s db=%s min=%s max=%s timeout=%s cache=%ss",
+            self.host,
+            DEFAULT_DATABASE,
+            min_size,
+            max_size,
+            timeout,
+            self.token_cache_duration_seconds,
+        )
+
+    async def _get_token_async(self) -> str:
+        """Get cached token or mint a new one if expired (async, non-blocking).
+
+        Uses asyncio.Lock for coroutine coordination. Token minting (a sync SDK call)
+        runs in an executor to avoid blocking the event loop.
+        """
+        async with self._cache_lock:
+            if cached_token := self._get_cached_token():
+                return cached_token
+
+            # Run the sync SDK call in an executor to not block the event loop
+            loop = asyncio.get_running_loop()
+            token = await loop.run_in_executor(None, self._mint_token)
+            self._cached_token = token
+            self._cache_ts = time.time()
+            return token
+
+    @property
+    def pool(self) -> AsyncConnectionPool[psycopg.AsyncConnection[DictRow]]:
+        """Access the underlying async connection pool."""
+        return self._pool
+
+    def connection(self):
+        """Get a connection from the async pool."""
+        return self._pool.connection()
+
+    async def open(self) -> None:
+        """Open the connection pool."""
+        await self._pool.open()
+
+    async def close(self) -> None:
+        """Close the connection pool."""
+        await self._pool.close()
+
+    async def __aenter__(self):
+        """Enter async context manager."""
+        await self.open()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Exit async context manager and close the connection pool."""
+        await self.close()
+        return False
+
+
+# =============================================================================
+# LakebaseClient - SQL execution and operations
+# =============================================================================
+
+
+class LakebaseClient:
+    """Client for executing SQL queries and managing Lakebase resources.
+
+    Example (simple):
+        client = LakebaseClient(instance_name="my-lakebase")
+        client.execute("SELECT * FROM users")
+        client.create_role("user@example.com", "USER")
+        client.close()
+
+    Example (end-to-end permission setup for an application):
+        from databricks_ai_bridge.lakebase import (
+            LakebaseClient,
+            SchemaPrivilege,
+            SequencePrivilege,
+            TablePrivilege,
+        )
+
+        # Create client and set up permissions for a service principal
+        with LakebaseClient(instance_name="my-lakebase") as client:
+            # 1. Create a PostgreSQL role for the service principal
+            client.create_role("my-app-service-principal-uuid", "SERVICE_PRINCIPAL")
+
+            # 2. Grant schema access
+            client.grant_schema(
+                grantee="my-app-service-principal-uuid",
+                privileges=[SchemaPrivilege.USAGE, SchemaPrivilege.CREATE],
+                schemas=["public", "app_schema"],
+            )
+
+            # 3. Grant table privileges on all tables in the schema
+            client.grant_all_tables_in_schema(
+                grantee="my-app-service-principal-uuid",
+                privileges=[TablePrivilege.SELECT, TablePrivilege.INSERT,
+                            TablePrivilege.UPDATE, TablePrivilege.DELETE],
+                schemas=["public", "app_schema"],
+            )
+
+            # 4. Grant sequence privileges (needed for INSERT with SERIAL columns)
+            client.grant_all_sequences_in_schema(
+                grantee="my-app-service-principal-uuid",
+                privileges=[SequencePrivilege.USAGE, SequencePrivilege.SELECT],
+                schemas=["public", "app_schema"],
+            )
+
+    Example (bring your own pool):
+        pool = LakebasePool(instance_name="my-lakebase", max_size=20)
+        client = LakebaseClient(pool=pool)
+        client.execute("SELECT * FROM users")
+        client.close()
+        pool.close()  # Pool is managed externally
+    """
+
+    def __init__(
+        self,
+        *,
+        pool: LakebasePool | None = None,
+        instance_name: str | None = None,
+        autoscaling_endpoint: str | None = None,
+        project: str | None = None,
+        branch: str | None = None,
+        **pool_kwargs: Any,
+    ) -> None:
+        """
+        Initialize LakebaseClient.
+
+        Provide EITHER:
+        - pool: An existing LakebasePool instance (advanced usage where multiple clients can connect to same pool)
+        - instance_name: Name of the Lakebase provisioned instance
+        - autoscaling_endpoint, or project + branch: Lakebase autoscaling
+
+        :param pool: Existing LakebasePool to use for connections.
+        :param instance_name: Name of the Lakebase provisioned instance.
+        :param autoscaling_endpoint: Lakebase autoscaling endpoint resource path.
+                See https://databricks-sdk-py.readthedocs.io/en/latest/dbdataclasses/postgres.html#databricks.sdk.service.postgres.Endpoint
+        :param project: Lakebase autoscaling project name. Also requires ``branch``.
+        :param branch: Lakebase autoscaling branch name. Also requires ``project``.
+        :param pool_kwargs: Additional kwargs passed to LakebasePool (only used when creating pool internally).
+        """
+        has_connection_params = (
+            instance_name is not None
+            or autoscaling_endpoint is not None
+            or project is not None
+            or branch is not None
+        )
+        if pool is not None and has_connection_params:
+            raise ValueError(
+                "Provide either 'pool' or connection parameters "
+                "('instance_name', 'autoscaling_endpoint', or 'project'/'branch'), not both."
+            )
+
+        if pool is None and not has_connection_params:
+            raise ValueError(
+                "Must provide 'pool', 'instance_name' (provisioned), "
+                "'autoscaling_endpoint', or 'branch' (autoscaling)."
+            )
+
+        self._owns_pool = pool is None
+
+        if pool is not None:
+            self._pool = pool
+        else:
+            self._pool = LakebasePool(
+                instance_name=instance_name,
+                autoscaling_endpoint=autoscaling_endpoint,
+                project=project,
+                branch=branch,
+                **pool_kwargs,
+            )
+
+    @property
+    def pool(self) -> LakebasePool:
+        """Access the underlying LakebasePool."""
+        return self._pool
+
+    def close(self) -> None:
+        """Close the client (and pool if it was created internally)."""
+        if self._owns_pool:
+            self._pool.close()
+
+    def __enter__(self):
+        """Enter context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager and close the client."""
+        self.close()
+        return False
+
+    # ---------------------------------------------------------
+    # SQL Execution
+    # ---------------------------------------------------------
+
+    def execute(self, sql: str, params: Optional[tuple | dict] = None) -> List[Any] | None:
+        """
+        Execute a SQL query against the Lakebase instance.
+
+        :param sql: The SQL query string.
+        :param params: Optional parameters for query interpolation (prevents SQL injection).
+        :return: List of rows (as dicts) if the query returns data, else None.
+
+        Example:
+            # DDL
+            client.execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
+
+            # Parameterized query (safe from SQL injection)
+            client.execute("SELECT * FROM users WHERE name = %s", ("Alice",))
+
+            # Named parameters
+            client.execute("SELECT * FROM users WHERE id = %(id)s", {"id": 1})
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                if cur.description:
+                    return cur.fetchall()
+                return None
+
+    # ---------------------------------------------------------
+    # Permission / Role Management
+    # ---------------------------------------------------------
+
+    def create_role(
+        self,
+        identity_name: str,
+        identity_type: IdentityType,
+        *,
+        ensure_extension: bool = True,
+    ) -> List[Any] | None:
+        """
+        Create a Databricks role for the given identity.
+        https://docs.databricks.com/aws/en/oltp/instances/pg-roles?language=PostgreSQL#create-postgres-roles-and-grant-privileges-for-databricks-identities
+
+        This enables role-based access control by registering a Databricks
+        user, service principal, or group as a PostgreSQL role.
+
+        If the role already exists, a warning is logged
+
+        :param identity_name: The Databricks identity name
+            (e.g., user email, service principal application ID, or group ID).
+        :param identity_type: The type of identity - must be one of:
+            "USER", "SERVICE_PRINCIPAL", or "GROUP".
+        :param ensure_extension: If True (default), ensures the databricks_auth
+            extension is created before creating the role.
+        :return: Result from databricks_create_role, or None if role already exists.
+        :raises ValueError: If identity_name is empty.
+        :raises PermissionError: If the caller lacks required permissions.
+
+        Example:
+            # Create a role for a service principal
+            client.create_role(
+                "service-principal-uuid",
+                "SERVICE_PRINCIPAL"
+            )
+        """
+        if not identity_name or not identity_name.strip():
+            raise ValueError(
+                "identity_name cannot be empty. Provide a valid Databricks identity "
+                "(user email, service principal UUID, or group ID)."
+            )
+
+        # Create the databricks_auth extension. Each Postgres database must have its own extension.
+        # https://docs.databricks.com/aws/en/oltp/instances/pg-roles#create-postgres-roles-and-grant-privileges-for-databricks-identities
+        try:
+            if ensure_extension:
+                self.execute("CREATE EXTENSION IF NOT EXISTS databricks_auth;")
+
+            query = f"SELECT databricks_create_role(%s, '{identity_type}');"
+            return self.execute(query, (identity_name,))
+        except psycopg.errors.DuplicateObject:
+            logger.info("Role '%s' already exists, skipping creation.", identity_name)
+            return None
+        except psycopg.errors.InvalidParameterValue as e:
+            raise ValueError(
+                f"Identity '{identity_name}' not found in the Databricks workspace. "
+                f"Ensure the {identity_type.lower().replace('_', ' ')} exists in your "
+                f"Databricks workspace before creating a role. "
+                f"Original error: {e}"
+            ) from e
+        except psycopg.errors.InsufficientPrivilege as e:
+            raise PermissionError(
+                f"Insufficient privileges to create role '{identity_name}'. "
+                f"Ensure you have 'CAN MANAGE' permission on the Lakebase instance. "
+                f"Original error: {e}"
+            ) from e
+        except psycopg.errors.UndefinedFunction as e:
+            raise RuntimeError(
+                f"The databricks_create_role function is not available. "
+                f"Ensure the databricks_auth extension is properly installed. "
+                f"See https://docs.databricks.com/aws/en/oltp/instances/pg-roles?language=PostgreSQL. "
+                f"Original error: {e}"
+            ) from e
+
+    def _format_privileges_str(
+        self,
+        privileges: Sequence[TablePrivilege]
+        | Sequence[SchemaPrivilege]
+        | Sequence[SequencePrivilege],
+    ) -> str:
+        """Format privileges as a string for logging."""
+        privilege_values = [p.value for p in privileges]
+        if "ALL" in privilege_values:
+            return "ALL PRIVILEGES"
+        return ", ".join(privilege_values)
+
+    def _format_privileges_sql(
+        self,
+        privileges: Sequence[TablePrivilege]
+        | Sequence[SchemaPrivilege]
+        | Sequence[SequencePrivilege],
+    ) -> sql.SQL | sql.Composed:
+        """Format privileges as a safe SQL fragment."""
+        # Check if ALL is in the list - if so, use ALL PRIVILEGES
+        privilege_values = [p.value for p in privileges]
+        if "ALL" in privilege_values:
+            return sql.SQL("ALL PRIVILEGES")
+        # Privileges are SQL keywords, so use sql.SQL for each
+        return sql.SQL(", ").join(sql.SQL(p) for p in privilege_values)  # type: ignore[invalid-argument-type]
+
+    def _execute_composed(self, query: sql.Composed) -> List[Any] | None:
+        """Execute a composed SQL query safely."""
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                if cur.description:
+                    return cur.fetchall()
+                return None
+
+    def _validate_non_empty(self, items: Sequence[Any], param_name: str) -> None:
+        """Validate that a sequence is not empty."""
+        if not items:
+            raise ValueError(
+                f"'{param_name}' cannot be empty. Provide at least one {param_name[:-1]}."
+            )
+
+    def _execute_grant(self, query: sql.Composed, operation_desc: str, grantee: str) -> None:
+        """Execute a GRANT query with helpful error handling.
+
+        :param query: The composed SQL query to execute.
+        :param operation_desc: Description of the operation for error messages.
+        :param grantee: The role being granted privileges (for error messages).
+        :raises PermissionError: If the user lacks required permissions.
+        :raises ValueError: If the target object does not exist.
+        """
+        try:
+            self._execute_composed(query)
+        except psycopg.errors.InsufficientPrivilege as e:
+            raise PermissionError(
+                f"Insufficient privileges to {operation_desc}. "
+                f"Ensure you have 'CAN MANAGE' permission on the Lakebase instance "
+                f"and appropriate ownership or GRANT OPTION on the target objects. "
+                f"Original error: {e}"
+            ) from e
+        except psycopg.errors.UndefinedObject as e:
+            raise ValueError(
+                f"Failed to {operation_desc}: object does not exist. "
+                f"Ensure the schema/table/sequence exists and the role '{grantee}' "
+                f"has been created. Original error: {e}"
+            ) from e
+        except psycopg.errors.InvalidSchemaName as e:
+            raise ValueError(
+                f"Failed to {operation_desc}: schema does not exist. "
+                f"Verify the schema name is correct. Original error: {e}"
+            ) from e
+        except psycopg.errors.UndefinedTable as e:
+            raise ValueError(
+                f"Failed to {operation_desc}: table does not exist. "
+                f"Verify the table name is correct. Original error: {e}"
+            ) from e
+        except psycopg.errors.InvalidGrantor as e:
+            raise PermissionError(
+                f"Cannot {operation_desc}: you must be the owner or have "
+                f"GRANT OPTION for these privileges. Original error: {e}"
+            ) from e
+
+    def _parse_table_identifier(self, table: str) -> sql.Identifier:
+        """Parse a table name into a SQL identifier.
+
+        :param table: Table name, optionally schema-qualified (e.g., "public.users").
+        :return: A psycopg sql.Identifier for safe SQL composition.
+        :raises ValueError: If the table name format is invalid.
+        """
+        if not table or not table.strip():
+            raise ValueError(
+                "Table name cannot be empty. Provide a valid table name "
+                "(e.g., 'users' or 'public.users')."
+            )
+
+        # Handle schema.table format
+        if "." in table:
+            parts = table.split(".", 1)
+            schema_name, table_name = parts[0].strip(), parts[1].strip()
+            if not schema_name or not table_name:
+                raise ValueError(
+                    f"Invalid table format '{table}'. Expected 'schema.table' "
+                    f"(e.g., 'public.users') or just 'table_name'."
+                )
+            return sql.Identifier(schema_name, table_name)
+        return sql.Identifier(table.strip())
+
+    def grant_schema(
+        self,
+        grantee: str,
+        privileges: Sequence[SchemaPrivilege],
+        schemas: Sequence[str],
+    ) -> None:
+        """
+        Grant schema-level privileges to a role.
+
+        :param grantee: The role to grant privileges to (e.g., service principal UUID).
+        :param privileges: List of SchemaPrivilege to grant.
+        :param schemas: List of schema names to grant privileges on.
+        :raises ValueError: If schemas or privileges is empty.
+        :raises PermissionError: If the caller lacks required permissions.
+
+        Example:
+            client.grant_schema(
+                grantee="app-sp-uuid",
+                privileges=[SchemaPrivilege.USAGE, SchemaPrivilege.CREATE],
+                schemas=["drizzle", "ai_chatbot", "public"],
+            )
+        """
+        self._validate_non_empty(schemas, "schemas")
+        self._validate_non_empty(privileges, "privileges")
+
+        privs = self._format_privileges_sql(privileges)
+        privs_str = self._format_privileges_str(privileges)
+
+        for schema in schemas:
+            query = sql.SQL("GRANT {privs} ON SCHEMA {schema} TO {grantee}").format(
+                privs=privs,
+                schema=sql.Identifier(schema),
+                grantee=sql.Identifier(grantee),
+            )
+            self._execute_grant(query, f"grant {privs_str} on schema '{schema}'", grantee)
+            logger.info("Granted %s on schema '%s' to '%s'", privs_str, schema, grantee)
+
+    def grant_all_tables_in_schema(
+        self,
+        grantee: str,
+        privileges: Sequence[TablePrivilege],
+        schemas: Sequence[str],
+    ) -> None:
+        """
+        Grant table-level privileges on ALL tables in the specified schemas.
+
+        :param grantee: The role to grant privileges to (e.g., service principal UUID).
+        :param privileges: List of TablePrivilege to grant.
+        :param schemas: List of schema names whose tables will receive the privileges.
+        :raises ValueError: If schemas or privileges is empty.
+        :raises PermissionError: If the caller lacks required permissions.
+
+        Example:
+            client.grant_all_tables_in_schema(
+                grantee="app-sp-uuid",
+                privileges=[TablePrivilege.SELECT, TablePrivilege.INSERT, TablePrivilege.UPDATE],
+                schemas=["drizzle", "ai_chatbot"],
+            )
+        """
+        self._validate_non_empty(schemas, "schemas")
+        self._validate_non_empty(privileges, "privileges")
+
+        privs = self._format_privileges_sql(privileges)
+        privs_str = self._format_privileges_str(privileges)
+
+        for schema in schemas:
+            query = sql.SQL("GRANT {privs} ON ALL TABLES IN SCHEMA {schema} TO {grantee}").format(
+                privs=privs,
+                schema=sql.Identifier(schema),
+                grantee=sql.Identifier(grantee),
+            )
+            self._execute_grant(
+                query, f"grant {privs_str} on all tables in schema '{schema}'", grantee
+            )
+            logger.info(
+                "Granted %s on all tables in schema '%s' to '%s'",
+                privs_str,
+                schema,
+                grantee,
+            )
+
+    def grant_table(
+        self,
+        grantee: str,
+        privileges: Sequence[TablePrivilege],
+        tables: Sequence[str],
+    ) -> None:
+        """
+        Grant table-level privileges on specific tables.
+
+        :param grantee: The role to grant privileges to (e.g., service principal UUID).
+        :param privileges: List of TablePrivilege to grant.
+        :param tables: List of table names (can be schema-qualified like "public.users").
+        :raises ValueError: If tables or privileges is empty, or table name format is invalid.
+        :raises PermissionError: If the caller lacks required permissions.
+
+        Example:
+            client.grant_table(
+                grantee="app-sp-uuid",
+                privileges=[TablePrivilege.SELECT, TablePrivilege.INSERT, TablePrivilege.UPDATE],
+                tables=[
+                    "public.checkpoint_migrations",
+                    "public.checkpoint_writes",
+                    "public.checkpoints",
+                    "public.checkpoint_blobs",
+                ],
+            )
+        """
+        self._validate_non_empty(tables, "tables")
+        self._validate_non_empty(privileges, "privileges")
+
+        privs = self._format_privileges_sql(privileges)
+        privs_str = self._format_privileges_str(privileges)
+
+        for table in tables:
+            table_ident = self._parse_table_identifier(table)
+
+            query = sql.SQL("GRANT {privs} ON {table} TO {grantee}").format(
+                privs=privs,
+                table=table_ident,
+                grantee=sql.Identifier(grantee),
+            )
+            self._execute_grant(query, f"grant {privs_str} on table '{table}'", grantee)
+            logger.info("Granted %s on table '%s' to '%s'", privs_str, table, grantee)
+
+    def grant_all_sequences_in_schema(
+        self,
+        grantee: str,
+        privileges: Sequence[SequencePrivilege],
+        schemas: Sequence[str],
+    ) -> None:
+        """
+        Grant sequence-level privileges on ALL sequences in the specified schemas.
+
+        :param grantee: The role to grant privileges to (e.g., service principal UUID).
+        :param privileges: List of SequencePrivilege to grant (USAGE, SELECT, UPDATE, ALL).
+        :param schemas: List of schema names whose sequences will receive the privileges.
+        :raises ValueError: If schemas or privileges is empty.
+        :raises PermissionError: If the caller lacks required permissions.
+
+        Example:
+            client.grant_all_sequences_in_schema(
+                grantee="app-sp-uuid",
+                privileges=[SequencePrivilege.USAGE, SequencePrivilege.SELECT, SequencePrivilege.UPDATE],
+                schemas=["public", "app_schema"],
+            )
+        """
+        self._validate_non_empty(schemas, "schemas")
+        self._validate_non_empty(privileges, "privileges")
+
+        privs = self._format_privileges_sql(privileges)
+        privs_str = self._format_privileges_str(privileges)
+
+        for schema in schemas:
+            query = sql.SQL(
+                "GRANT {privs} ON ALL SEQUENCES IN SCHEMA {schema} TO {grantee}"
+            ).format(
+                privs=privs,
+                schema=sql.Identifier(schema),
+                grantee=sql.Identifier(grantee),
+            )
+            self._execute_grant(
+                query,
+                f"grant {privs_str} on all sequences in schema '{schema}'",
+                grantee,
+            )
+            logger.info(
+                "Granted %s on all sequences in schema '%s' to '%s'",
+                privs_str,
+                schema,
+                grantee,
+            )
+
+
+# =============================================================================
+# AsyncLakebaseSQLAlchemy - SQLAlchemy async engine factory
+# =============================================================================
+
+
+class AsyncLakebaseSQLAlchemy(_LakebaseBase):
+    """Async SQLAlchemy engine factory for Databricks Lakebase.
+
+    Provides an AsyncEngine with automatic OAuth token injection via
+    SQLAlchemy's do_connect event. Tokens are cached and refreshed
+    every 15 minutes.
+
+    Note:
+        This class is **async-only**. The engine uses SQLAlchemy's
+        async extension with the psycopg driver.
+
+    Reference:
+        https://docs.databricks.com/aws/en/oltp/instances/authentication
+
+    Example:
+        ```python
+        from databricks_ai_bridge.lakebase import AsyncLakebaseSQLAlchemy
+
+        # Create once and reuse the engine
+        lakebase = AsyncLakebaseSQLAlchemy(instance_name="my-lakebase")
+
+        async with lakebase.engine.connect() as conn:
+            result = await conn.execute(text("SELECT 1"))
+        ```
+    """
+
+    def __init__(
+        self,
+        *,
+        instance_name: str | None = None,
+        autoscaling_endpoint: str | None = None,
+        project: str | None = None,
+        branch: str | None = None,
+        workspace_client: WorkspaceClient | None = None,
+        token_cache_duration_seconds: int = DEFAULT_TOKEN_CACHE_DURATION_SECONDS,
+        pool_recycle: int = DEFAULT_POOL_RECYCLE_SECONDS,
+        **engine_kwargs,
+    ) -> None:
+        """
+        Initialize AsyncLakebaseSQLAlchemy for Databricks Lakebase.
+
+        Args:
+            instance_name: Name of the Lakebase provisioned instance.
+            autoscaling_endpoint: Lakebase autoscaling endpoint resource path.
+                See https://databricks-sdk-py.readthedocs.io/en/latest/dbdataclasses/postgres.html#databricks.sdk.service.postgres.Endpoint
+            project: Lakebase autoscaling project name. Also requires ``branch``.
+            branch: Lakebase autoscaling branch name. Also requires ``project``.
+            workspace_client: Optional WorkspaceClient for authentication.
+                If not provided, a default client will be created.
+            token_cache_duration_seconds: How long to cache OAuth tokens.
+                Defaults to 15 minutes.
+            pool_recycle: Connection pool recycle time in seconds.
+                Defaults to 14 minutes (before token cache expires).
+            **engine_kwargs: Additional keyword arguments passed to
+                SQLAlchemy's create_async_engine().
+        """
+        super().__init__(
+            instance_name=instance_name,
+            autoscaling_endpoint=autoscaling_endpoint,
+            project=project,
+            branch=branch,
+            workspace_client=workspace_client,
+            token_cache_duration_seconds=token_cache_duration_seconds,
+        )
+
+        # Thread-safe lock for token caching (do_connect is sync context)
+        self._cache_lock = Lock()
+        self._pool_recycle = pool_recycle
+        self._engine = self._create_engine(**engine_kwargs)
+
+        logger.info(
+            "AsyncLakebaseSQLAlchemy initialized: host=%s",
+            self.host,
+        )
+
+    @property
+    def engine(self) -> "AsyncEngine":
+        """The SQLAlchemy AsyncEngine."""
+        return self._engine
+
+    def get_token(self) -> str:
+        """Get cached token or mint a new one (thread-safe)."""
+        with self._cache_lock:
+            if cached := self._get_cached_token():
+                return cached
+            token = self._mint_token()
+            self._cached_token = token
+            self._cache_ts = time.time()
+            return token
+
+    def _create_url(self) -> "URL":
+        """Create SQLAlchemy URL for Lakebase connection."""
+        from sqlalchemy import URL
+
+        # Create engine without password - token injected via event listener
+        # Note: empty password in URL, actual token provided on connect
+        return URL.create(
+            drivername="postgresql+psycopg",
+            username=self.username,
+            host=self.host,
+            port=DEFAULT_PORT,
+            database=DEFAULT_DATABASE,
+        )
+
+    def _create_engine(self, **engine_kwargs) -> "AsyncEngine":
+        """Create AsyncEngine with do_connect event for token injection."""
+        from sqlalchemy import event
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        url = self._create_url()
+
+        engine: AsyncEngine = create_async_engine(
+            url,
+            pool_recycle=self._pool_recycle,
+            connect_args={"sslmode": DEFAULT_SSLMODE},
+            **engine_kwargs,
+        )
+
+        # AsyncEngine wraps a sync Engine internally - connection events like
+        # do_connect must be registered on sync_engine, not the async wrapper.
+        # https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#using-events-with-the-asyncio-extension
+        # Lakebase docs https://docs.databricks.com/aws/en/oltp/projects/authentication?language=Python%3A+SQLAlchemy
+        @event.listens_for(engine.sync_engine, "do_connect")
+        def inject_token(dialect, conn_rec, cargs, cparams):
+            token = self.get_token()
+            cparams["password"] = token
+            logger.debug(
+                "Injected Lakebase token for connection: user=%s, host=%s, token=%s...%s (len=%d)",
+                self.username,
+                self.host,
+                token[:10],
+                token[-5:],
+                len(token),
+            )
+
+        return engine
